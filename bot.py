@@ -311,9 +311,17 @@ def publish_top_news():
         base_weight = feed_info["weight"]
 
         try:
-            feed = feedparser.parse(feed_url)
+            rss_resp = requests.get(
+                feed_url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=8
+            )
+            if rss_resp.status_code != 200:
+                print(f"Пропуск {source_name}: статус {rss_resp.status_code}")
+                continue
+            feed = feedparser.parse(rss_resp.content)
         except Exception as e:
-            print(f"Ошибка парсинга {source_name}: {e}")
+            print(f"Таймаут или ошибка {source_name}: {e}")
             continue
 
         for entry in feed.entries[:15]:
@@ -388,4 +396,3 @@ def publish_top_news():
 if __name__ == "__main__":
     init_db()
     publish_top_news()
-          
