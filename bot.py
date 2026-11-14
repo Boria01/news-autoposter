@@ -123,11 +123,45 @@ def clean_text(raw_html):
         return ""
     text = html.unescape(raw_html)
     text = re.sub(r'<.*?>', '', text)
-    text = re.sub(r'^(ТАСС|РИА Новости|РБК|Интерфакс)\s*:\s*', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'^[А-ЯЁ\-]+,\s*\d+\s+[а-яё]+\s*[—–-]\s*(РИА Новости|ТАСС|Интерфакс)\.\s*', '', text)
-    for footer_marker in ("Главный редактор:", "Политика АНО «ТВ-Новости»", "Организации, признанные экстремистскими"):
-        if footer_marker in text:
-            text = text.split(footer_marker)[0]
+    text = " ".join(text.split())
+
+    # 1. Срезаем стандартные информагентства в начале строки (Москва. 14 ноября. INTERFAX.RU - / МОСКВА, 14 ноя — РИА Новости.)
+    text = re.sub(
+        r'^[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+[\.,]\s*\d+\s+[а-яё]+\.?\s*[—–\-]\s*(?:INTERFAX\.RU|Интерфакс|РИА Новости|ТАСС|РБК|ПРАЙМ|ИА REGNUM)\s*[—–\-\.]\s*',
+        '',
+        text,
+        flags=re.IGNORECASE
+    )
+    # 2. Срезаем прямые префиксы в начале (INTERFAX.RU -, ТАСС:, РИА Новости:)
+    text = re.sub(
+        r'^(?:INTERFAX\.RU|Интерфакс|ТАСС|РИА Новости|РБК|Известия|Ведомости|Коммерсантъ|Лента\.ру|Газета\.Ru)\s*[:\-—–]\s*',
+        '',
+        text,
+        flags=re.IGNORECASE
+    )
+
+    # 3. Обрезаем подвальные маркеры, если они прилипли в конец абзаца
+    footer_markers = (
+        "Главный редактор:",
+        "Политика АНО «ТВ-Новости»",
+        "Организации, признанные экстремистскими",
+        "Вся информация, размещенная на данном веб-сайте",
+        "Сетевое издание",
+        "Свидетельство о регистрации",
+        "© 199",
+        "© 200",
+        "© 201",
+        "© 202",
+        "Все права защищены",
+        "Нашли опечатку?",
+        "Читайте также:",
+        "Подписывайтесь на наш"
+    )
+    for marker in footer_markers:
+        idx = text.lower().find(marker.lower())
+        if idx != -1:
+            text = text[:idx]
+
     return " ".join(text.split())
 
 
@@ -158,6 +192,26 @@ def extract_clean_rss_image(entry):
     return None
 
 
+def decode_html_properly(resp):
+    # Определяем реальную кодировку страницы (исправляет кракозябры на Интерфаксе и старых сайтах)
+    content_type = resp.headers.get("Content-Type", "").lower()
+    if "windows-1251" in content_type or "cp1251" in content_type:
+        return resp.content.decode("windows-1251", errors="replace")
+    if "utf-8" in content_type:
+        return resp.content.decode("utf-8", errors="replace")
+
+    head_sample = resp.content[:2048].lower()
+    if b"windows-1251" in head_sample or b"cp1251" in head_sample:
+        return resp.content.decode("windows-1251", errors="replace")
+
+    if resp.apparent_encoding:
+        try:
+            return resp.content.decode(resp.apparent_encoding, errors="replace")
+        except Exception:
+            pass
+    return resp.content.decode("utf-8", errors="replace")
+
+
 def fetch_full_article_paragraphs(url, fallback_summary, title):
     try:
         headers = {
@@ -167,18 +221,21 @@ def fetch_full_article_paragraphs(url, fallback_summary, title):
         if resp.status_code != 200:
             return [fallback_summary] if fallback_summary else []
 
-        html_body = re.sub(r'<(script|style|header|footer|nav|aside)[^>]*>.*?</\1>', '', resp.text, flags=re.DOTALL | re.IGNORECASE)
+        raw_html = decode_html_properly(resp)
+        html_body = re.sub(r'<(script|style|header|footer|nav|aside)[^>]*>.*?</\1>', '', raw_html, flags=re.DOTALL | re.IGNORECASE)
         raw_paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', html_body, flags=re.DOTALL | re.IGNORECASE)
 
         good_paragraphs = []
         junk_phrases = (
             "читайте также", "подписывайтесь", "фото:", "источник:", "риа новости",
-            "тасс", "интерфакс", "рбк", "все права защищены", "использование материалов",
+            "тасс", "интерфакс", "interfax", "рбк", "все права защищены", "использование материалов",
             "зарегистрировано", "роскомнадзор", "cookie", "нашли опечатку",
             "материал дополняется", "подробнее в нашем", "наш телеграм",
             "главный редактор:", "адрес редакции:", "политика ано",
             "организации, признанные экстремистскими", "обработки персональных данных",
-            "сетевое издание", "учредитель:", "свидетельство о регистрации"
+            "сетевое издание", "учредитель:", "свидетельство о регистрации",
+            "вся информация, размещенная на данном", "перепечатка материалов",
+            "редакция не несет ответственности", "сообщает корреспондент"
         )
 
         total_len = 0
@@ -188,6 +245,9 @@ def fetch_full_article_paragraphs(url, fallback_summary, title):
                 continue
             low = cleaned.lower()
             if any(jp in low for jp in junk_phrases):
+                continue
+            # Отсекаем абзацы со сломанной кодировкой (знаки замены )
+            if "\ufffd" in cleaned:
                 continue
             if cleaned.lower() == title.lower():
                 continue
@@ -298,7 +358,7 @@ def publish_top_news():
     is_night = not is_day_mode()
     now_msk = datetime.now(MSK_TZ)
 
-    # Ночью проверяем только раз в 30 минут (в :00 и :30 каждого часа), пропуская запуски на :10, :20, :40, :50
+    # Ночью проверяем только раз в 30 минут (в :00 и :30 каждого часа)
     if is_night and now_msk.minute not in range(0, 8) and now_msk.minute not in range(30, 38):
         print(f"[{now_msk.strftime('%H:%M')} МСК] Ночной режим: пропуск промежуточного тика.")
         return
@@ -330,6 +390,8 @@ def publish_top_news():
             summary = clean_text(entry.get("summary", entry.get("description", "")))
 
             if not link or not title:
+                continue
+            if "\ufffd" in title or "\ufffd" in summary:
                 continue
             if is_bad_content(link, title, summary):
                 continue
