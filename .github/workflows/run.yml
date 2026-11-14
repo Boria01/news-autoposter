@@ -1,9 +1,8 @@
 name: News Bot
 
 on:
+  # Только внешний точный запуск в :00 и :30 (без плавающих задержек GitHub)
   workflow_dispatch:
-  schedule:
-    - cron: '*/15 * * * *'
 
 permissions:
   contents: write
@@ -12,28 +11,26 @@ jobs:
   run-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 3
-
     steps:
-      - name: Checkout repository
+      - name: Забираем код и базу
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Настраиваем Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Устанавливаем зависимости
         run: pip install feedparser requests
 
-      - name: Run bot
+      - name: Запускаем бота
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: python bot.py
 
-      - name: Commit updated database
+      - name: Сохраняем историю постов в базу
         run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
+          git config user.name "NewsBot"
+          git config user.email "bot@users.noreply.github.com"
           git add news_history.db
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update news history" && git push)
-          
+          git diff --staged --quiet || (git commit -m "Update news history" && git push)
