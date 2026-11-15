@@ -12,9 +12,8 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHANNEL_ID = "@glavnoe_chasa"
 
 MSK_TZ = timezone(timedelta(hours=3))
-WORK_START_HOUR = 7
-WORK_END_HOUR = 1
-NIGHT_MIN_SCORE = 12
+WORK_START_HOUR = 9   # со скольки утра по МСК начинать постить (например, с 09:00)
+WORK_END_HOUR = 1     # до скольки ночи по МСК постить (с 01:00 до 09:00 — полный сон)
 
 RSS_FEEDS = [
     # Федеральная база (высший приоритет)
@@ -125,14 +124,14 @@ def clean_text(raw_html):
     text = re.sub(r'<.*?>', '', text)
     text = " ".join(text.split())
 
-    # 1. Срезаем стандартные информагентства в начале строки (Москва. 14 ноября. INTERFAX.RU - / МОСКВА, 14 ноя — РИА Новости.)
+    # 1. Срезаем стандартные информагентства в начале строки
     text = re.sub(
         r'^[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+[\.,]\s*\d+\s+[а-яё]+\.?\s*[—–\-]\s*(?:INTERFAX\.RU|Интерфакс|РИА Новости|ТАСС|РБК|ПРАЙМ|ИА REGNUM)\s*[—–\-\.]\s*',
         '',
         text,
         flags=re.IGNORECASE
     )
-    # 2. Срезаем прямые префиксы в начале (INTERFAX.RU -, ТАСС:, РИА Новости:)
+    # 2. Срезаем прямые префиксы в начале
     text = re.sub(
         r'^(?:INTERFAX\.RU|Интерфакс|ТАСС|РИА Новости|РБК|Известия|Ведомости|Коммерсантъ|Лента\.ру|Газета\.Ru)\s*[:\-—–]\s*',
         '',
@@ -140,25 +139,26 @@ def clean_text(raw_html):
         flags=re.IGNORECASE
     )
 
-    # 3. Обрезаем подвальные маркеры, если они прилипли в конец абзаца
+    # 3. Отрезаем любые знаки копирайта © до конца строки
+    text = re.sub(r'©.*$', '', text)
+
+    # 4. Обрезаем подвальные маркеры, если они прилипли в конец абзаца
     footer_markers = (
-        "Главный редактор:",
-        "Политика АНО «ТВ-Новости»",
-        "Организации, признанные экстремистскими",
-        "Вся информация, размещенная на данном веб-сайте",
-        "Сетевое издание",
-        "Свидетельство о регистрации",
-        "© 199",
-        "© 200",
-        "© 201",
-        "© 202",
-        "Все права защищены",
-        "Нашли опечатку?",
-        "Читайте также:",
-        "Подписывайтесь на наш"
+        "автономная некоммерческая организация",
+        "«тв-новости»",
+        "главный редактор:",
+        "политика ано",
+        "организации, признанные экстремистскими",
+        "вся информация, размещенная на данном веб-сайте",
+        "сетевое издание",
+        "свидетельство о регистрации",
+        "все права защищены",
+        "нашли опечатку?",
+        "читайте также:",
+        "подписывайтесь на наш"
     )
     for marker in footer_markers:
-        idx = text.lower().find(marker.lower())
+        idx = text.lower().find(marker)
         if idx != -1:
             text = text[:idx]
 
@@ -176,7 +176,9 @@ def is_bad_content(link, title, summary):
 def is_day_mode():
     now_msk = datetime.now(MSK_TZ)
     hour = now_msk.hour
-    return hour >= WORK_START_HOUR or hour < WORK_END_HOUR
+    if WORK_START_HOUR > WORK_END_HOUR:
+        return hour >= WORK_START_HOUR or hour < WORK_END_HOUR
+    return WORK_START_HOUR <= hour < WORK_END_HOUR
 
 
 def extract_clean_rss_image(entry):
@@ -193,7 +195,6 @@ def extract_clean_rss_image(entry):
 
 
 def decode_html_properly(resp):
-    # Определяем реальную кодировку страницы (исправляет кракозябры на Интерфаксе и старых сайтах)
     content_type = resp.headers.get("Content-Type", "").lower()
     if "windows-1251" in content_type or "cp1251" in content_type:
         return resp.content.decode("windows-1251", errors="replace")
@@ -222,7 +223,23 @@ def fetch_full_article_paragraphs(url, fallback_summary, title):
             return [fallback_summary] if fallback_summary else []
 
         raw_html = decode_html_properly(resp)
-        html_body = re.sub(r'<(script|style|header|footer|nav|aside)[^>]*>.*?</\1>', '', raw_html, flags=re.DOTALL | re.IGNORECASE)
+        html_body = re.sub(
+            r'<(script|style|header|footer|nav|aside)[^>]*>.*?</\1>',
+            '',
+            raw_html,
+            flags=re.DOTALL | re.IGNORECASE
+        )
+
+        # Отрезаем хвост страницы с блоками "Читайте также / Похожие новости / Подвал статьи"
+        cut_patterns = [
+            r'<div[^>]+class="[^"]*(?:related|read-more|also-read|recommend|article__footer|social|comments)[^"]*"',
+            r'<section[^>]+class="[^"]*(?:related|read-more|also-read|recommend)[^"]*"'
+        ]
+        for pat in cut_patterns:
+            m = re.search(pat, html_body, flags=re.IGNORECASE)
+            if m and m.start() > 500:
+                html_body = html_body[:m.start()]
+
         raw_paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', html_body, flags=re.DOTALL | re.IGNORECASE)
 
         good_paragraphs = []
@@ -232,10 +249,11 @@ def fetch_full_article_paragraphs(url, fallback_summary, title):
             "зарегистрировано", "роскомнадзор", "cookie", "нашли опечатку",
             "материал дополняется", "подробнее в нашем", "наш телеграм",
             "главный редактор:", "адрес редакции:", "политика ано",
+            "автономная некоммерческая организация", "«тв-новости»", "тв-новости",
             "организации, признанные экстремистскими", "обработки персональных данных",
             "сетевое издание", "учредитель:", "свидетельство о регистрации",
             "вся информация, размещенная на данном", "перепечатка материалов",
-            "редакция не несет ответственности", "сообщает корреспондент"
+            "редакция не несет ответственности", "сообщает корреспондент", "©"
         )
 
         total_len = 0
@@ -246,7 +264,6 @@ def fetch_full_article_paragraphs(url, fallback_summary, title):
             low = cleaned.lower()
             if any(jp in low for jp in junk_phrases):
                 continue
-            # Отсекаем абзацы со сломанной кодировкой (знаки замены )
             if "\ufffd" in cleaned:
                 continue
             if cleaned.lower() == title.lower():
@@ -254,7 +271,8 @@ def fetch_full_article_paragraphs(url, fallback_summary, title):
             if cleaned in good_paragraphs:
                 continue
 
-            if total_len + len(cleaned) > 3800:
+            # Берём максимум 4 основных абзаца статьи, чтобы не захватить чужие врезки снизу
+            if len(good_paragraphs) >= 4 or total_len + len(cleaned) > 1800:
                 break
             good_paragraphs.append(cleaned)
             total_len += len(cleaned) + 2
@@ -355,12 +373,11 @@ def publish_full_article(title, paragraphs, image_url=None):
 
 
 def publish_top_news():
-    is_night = not is_day_mode()
     now_msk = datetime.now(MSK_TZ)
 
-    # Ночью проверяем только раз в 30 минут (в :00 и :30 каждого часа)
-    if is_night and now_msk.minute not in range(0, 8) and now_msk.minute not in range(30, 38):
-        print(f"[{now_msk.strftime('%H:%M')} МСК] Ночной режим: пропуск промежуточного тика.")
+    # Полный ночной сон (с WORK_END_HOUR до WORK_START_HOUR по МСК) — никаких постов ночью
+    if not is_day_mode():
+        print(f"[{now_msk.strftime('%H:%M')} МСК] Ночной режим (сон до {WORK_START_HOUR:02d}:00 МСК). Пропуск.")
         return
 
     candidates = []
@@ -395,7 +412,7 @@ def publish_top_news():
                 continue
             if is_bad_content(link, title, summary):
                 continue
-            if not is_night and (len(summary) < 40 or summary.lower() == title.lower()):
+            if len(summary) < 40 or summary.lower() == title.lower():
                 continue
 
             keywords = extract_keywords(title)
@@ -431,26 +448,16 @@ def publish_top_news():
     candidates.sort(key=lambda x: x["score"], reverse=True)
     now_str = now_msk.strftime("%H:%M")
 
-    if is_night:
-        top_score = candidates[0]["score"]
-        if top_score < NIGHT_MIN_SCORE:
-            print(f"[{now_str} МСК] Ночной режим: экстренных событий нет (макс. рейтинг {top_score}/{NIGHT_MIN_SCORE}).")
-            return
-
     for best_news in candidates[:15]:
-        if is_night and best_news["score"] < NIGHT_MIN_SCORE:
-            break
-
         image_url = best_news["image_url"]
-        if not image_url and not is_night:
+        if not image_url:
             continue
 
         paragraphs = fetch_full_article_paragraphs(best_news["link"], best_news["summary"], best_news["title"])
 
         if publish_full_article(best_news["title"], paragraphs, image_url):
-            mode_label = "НОЧНАЯ МОЛНИЯ" if is_night else "Опубликовано"
             total_chars = sum(len(p) for p in paragraphs)
-            print(f"[{now_str} МСК] {mode_label} ({total_chars} зн., рейтинг {best_news['score']}): {best_news['title']}")
+            print(f"[{now_str} МСК] Опубликовано ({total_chars} зн., рейтинг {best_news['score']}): {best_news['title']}")
             mark_as_posted(best_news["link"], best_news["title"], best_news["keywords"])
             return
 
@@ -458,3 +465,4 @@ def publish_top_news():
 if __name__ == "__main__":
     init_db()
     publish_top_news()
+        
