@@ -13,7 +13,7 @@ GEMINI_MODEL = "gemini-3.5-flash-lite"
 CHANNEL_ID = "@glavnoe_chasa"
 
 MSK_TZ = timezone(timedelta(hours=3))
-WORK_START_HOUR = 9
+WORK_START_HOUR = 7
 WORK_END_HOUR = 1
 DIGEST_HOUR = 21
 
