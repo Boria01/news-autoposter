@@ -64,8 +64,8 @@ EDITOR_PROMPT = (
     "3. Формат:\n"
     "Первая строка — точный заголовок без кавычек.\n"
     "Пустая строка — 1 короткое предложение с главным событием.\n"
-    "Пустая строка — 2–4 коротких пункта с деталями через символ «• ».\n"
-    "4. Длина всего текста: строго от 350 до 750 символов. Никакого Markdown (** или #) и HTML-тегов."
+    "Пустая строка — 2–4 коротких пункта с деталями через символ «• » (если исходный текст короткий — оформи 1–2 абзаца без воды).\n"
+    "4. Длина всего текста: от 250 до 750 символов. Никакого Markdown (** или #) и HTML-тегов."
 )
 
 DIGEST_PROMPT = (
@@ -73,7 +73,7 @@ DIGEST_PROMPT = (
     "Правила:\n"
     "1. Выбери 5–6 самых значимых событий из списка (ничего не выдумывай).\n"
     "2. Оформи каждое событие отдельным пунктом с новой строки, начиная с строгого эмодзи (🔹, ⚡️, 🏛, 📈, 🛡) и короткого заголовка, затем 1 лаконичное предложение с сутью.\n"
-    "3. Без воды, без приветствий и прощаний, без Markdown (** или #) и HTML-тегов. Длина: до 1400 символов."
+    "3. Без воды, без приветствий и прощаний, без Markdown (** или #) и без HTML-тегов. Длина: до 1400 символов."
 )
 
 
@@ -262,7 +262,7 @@ def fetch_raw_article_text(entry, url, title):
 
 def format_post_html(title, raw_body):
     ai = call_gemini(EDITOR_PROMPT, f"Заголовок: {title}\n\nТекст новости:\n{raw_body[:3000]}", max_tokens=450)
-    if ai and len(ai) >= 180:
+    if ai and len(ai) >= 140:
         lines = [l.strip() for l in ai.splitlines() if l.strip()]
         if len(lines) >= 2:
             out = f"<b>{html.escape(lines[0])}</b>\n\n" + "\n\n".join(html.escape(l) for l in lines[1:])
@@ -319,7 +319,7 @@ def publish_top_news():
             if len(kw) < 2 or is_duplicate_in_db(link, kw):
                 continue
             bonus = 4 if any(w in (title + " " + summary).lower() for w in BREAKING_WORDS) else 0
-            candidates.append({"entry": e, "source": f["name"], "link": link, "title": title, "image_url": extract_clean_rss_image(e), "keywords": kw, "score": f["weight"] + bonus})
+            candidates.append({"entry": e, "source": f["name"], "link": link, "title": title, "summary": summary, "image_url": extract_clean_rss_image(e), "keywords": kw, "score": f["weight"] + bonus})
     if not candidates:
         print("Свежих новостей без повторов не найдено.")
         return
@@ -328,12 +328,14 @@ def publish_top_news():
             if i != j and candidates[i]["source"] != candidates[j]["source"] and calculate_similarity(candidates[i]["keywords"], candidates[j]["keywords"]) >= 0.45:
                 candidates[i]["score"] += 5
     candidates.sort(key=lambda x: x["score"], reverse=True)
-    for best in candidates[:15]:
+    for best in candidates[:30]:
         if not best["image_url"]:
             continue
         raw_body = fetch_raw_article_text(best["entry"], best["link"], best["title"])
-        if len(raw_body) < 250:
-            print(f"Пропуск (нет полного текста): {best['title']}")
+        if len(raw_body) < 120:
+            raw_body = best["summary"]
+        if len(raw_body) < 110:
+            print(f"Пропуск (слишком короткий текст): {best['title']}")
             continue
         post_html = format_post_html(best["title"], raw_body)
         if send_photo_post(post_html, best["image_url"]):
@@ -345,3 +347,4 @@ def publish_top_news():
 if __name__ == "__main__":
     init_db()
     publish_top_news()
+    
