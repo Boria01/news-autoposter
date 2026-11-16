@@ -9,25 +9,29 @@ import requests
 
 # ================= НАСТРОЙКИ =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = "gemini-3.5-flash-lite"
 CHANNEL_ID = "@glavnoe_chasa"
 
 MSK_TZ = timezone(timedelta(hours=3))
-WORK_START_HOUR = 9   # со скольки утра по МСК начинать постить (09:00)
-WORK_END_HOUR = 1     # до скольки ночи по МСК постить (с 01:00 до 09:00 — полный сон)
+WORK_START_HOUR = 9    # начало работы утром по МСК (09:00)
+WORK_END_HOUR = 1      # конец работы ночью по МСК (с 01:00 до 09:00 — полный сон)
+DIGEST_HOUR = 21       # час публикации вечерних итогов дня по МСК (21:00–21:59)
+
+MONTHS_RU = {
+    1: "января", 2: "февраля", 3: "марта", 4: "апреля",
+    5: "мая", 6: "июня", 7: "июля", 8: "августа",
+    9: "сентября", 10: "октября", 11: "ноября", 12: "декабря"
+}
 
 RSS_FEEDS = [
-    # Федеральная база (высший приоритет)
     {"name": "ТАСС", "url": "https://tass.ru/rss/v2.xml", "weight": 3},
     {"name": "РИА Новости", "url": "https://ria.ru/export/rss2/archive/index.xml", "weight": 3},
     {"name": "РБК", "url": "https://rssexport.rbc.ru/rbcnews/news/30/full.rss", "weight": 3},
     {"name": "Интерфакс", "url": "https://www.interfax.ru/rss.asp", "weight": 3},
-
-    # Деловая и аналитическая пресса (эксклюзивы, законы, экономика)
     {"name": "Коммерсантъ", "url": "https://www.kommersant.ru/RSS/news.xml", "weight": 3},
     {"name": "Ведомости", "url": "https://www.vedomosti.ru/rss/news", "weight": 2},
     {"name": "Forbes Russia", "url": "https://www.forbes.ru/newrss.xml", "weight": 2},
-
-    # Оперативные новости, происшествия и резонанс
     {"name": "Известия", "url": "https://iz.ru/xml/rss/all.xml", "weight": 2},
     {"name": "Газета.Ru", "url": "https://www.gazeta.ru/export/rss/lenta.xml", "weight": 1},
     {"name": "Лента.ру", "url": "https://lenta.ru/rss/news", "weight": 1},
@@ -52,6 +56,27 @@ BREAKING_WORDS = [
 ]
 
 IGNORE_WORDS = {"в", "на", "и", "с", "по", "о", "об", "из", "за", "к", "от", "для", "не", "что", "как", "при", "до", "после"}
+
+EDITOR_PROMPT = (
+    "Ты — выпускающий редактор новостной ленты. Сожми исходную новость в плотный, читаемый пост для Telegram.\n"
+    "Жесткие правила:\n"
+    "1. Запрещена любая вода, оценки, эпитеты, вводные слова и домыслы. Оставляй ТОЛЬКО конкретные факты из текста: цифры, даты, имена, должности, города и действия.\n"
+    "2. Убирай канцелярит (слова «в течение прошедшего времени», «осуществляется», «данный», «в рамках»).\n"
+    "3. Формат:\n"
+    "Первая строка — точный заголовок без кавычек.\n"
+    "Пустая строка — 1 короткое предложение с главным событием.\n"
+    "Пустая строка — 2–4 коротких пункта с деталями через символ «• ».\n"
+    "4. Длина всего текста: строго от 350 до 750 символов. Никакого Markdown (** или #) и HTML-тегов."
+)
+
+DIGEST_PROMPT = (
+    "Ты — редактор новостного Telegram-канала. На основе списка опубликованных за день заголовков и фактов составь вечернюю сводку «Итоги дня».\n"
+    "Правила:\n"
+    "1. Выбери 5–6 самых значимых событий из переданного списка (не придумывай ничего от себя).\n"
+    "2. Оформи каждое событие отдельным пунктом с новой строки, начиная с подходящего строгого эмодзи (например: 🔹, ⚡️, 🏛, 📈, 🛡) и короткого заголовка, затем 1 лаконичное предложение с сутью.\n"
+    "3. Без воды, без приветствий и прощаний, без Markdown (** или #) и без HTML-тегов.\n"
+    "4. Общая длина текста: до 1400 символов."
+)
 # =============================================
 
 
@@ -64,6 +89,12 @@ def init_db():
             link TEXT UNIQUE,
             title TEXT,
             keywords TEXT,
+            published_at REAL
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS daily_digests (
+            date_key TEXT PRIMARY KEY,
             published_at REAL
         )
     """)
@@ -117,6 +148,102 @@ def mark_as_posted(link, title, keywords):
     conn.close()
 
 
+def call_gemini(system_prompt, user_text, max_tokens=500):
+    if not GEMINI_API_KEY:
+        return None
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY
+    }
+    payload = {
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{
+            "role": "user",
+            "parts": [{"text": user_text}]
+        }],
+        "generationConfig": {
+            "temperature": 0.3,
+            "maxOutputTokens": max_tokens
+        }
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=20)
+        if resp.status_code != 200:
+            print(f"Ошибка Gemini HTTP {resp.status_code}: {resp.text[:200]}")
+            return None
+        data = resp.json()
+        parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+        result = "".join(p.get("text", "") for p in parts).strip()
+        result = re.sub(r'\*\*(.*?)\*\*', r'\1', result)
+        return result
+    except Exception as e:
+        print(f"Исключение Gemini: {e}")
+        return None
+
+
+def send_text_message(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHANNEL_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=15)
+        return r.status_code == 200
+    except Exception as e:
+        print(f"Ошибка отправки текста: {e}")
+        return False
+
+
+def try_publish_evening_digest(now_msk):
+    if now_msk.hour != DIGEST_HOUR or not GEMINI_API_KEY:
+        return False
+
+    date_key = now_msk.strftime("%Y-%m-%d")
+    conn = sqlite3.connect("news_history.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM daily_digests WHERE date_key = ?", (date_key,))
+    if cursor.fetchone():
+        conn.close()
+        return False
+
+    cutoff = time.time() - 16 * 3600
+    cursor.execute("SELECT title FROM posted_news WHERE published_at > ? ORDER BY id ASC", (cutoff,))
+    titles = [row[0] for row in cursor.fetchall() if row[0]]
+    conn.close()
+
+    if len(titles) < 4:
+        return False
+
+    titles_block = "\n".join(f"- {t}" for t in titles[:25])
+    digest_body = call_gemini(DIGEST_PROMPT, f"Новости за день:\n{titles_block}", max_tokens=650)
+    if not digest_body or len(digest_body) < 200:
+        return False
+
+    date_label = f"{now_msk.day} {MONTHS_RU[now_msk.month]} {now_msk.year}"
+    header = f"🗞 <b>{date_label} — итоги дня</b>"
+    escaped_body = html.escape(digest_body)
+    full_digest = f"{header}\n\n{escaped_body}"[:4090]
+
+    if send_text_message(full_digest):
+        conn = sqlite3.connect("news_history.db")
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR IGNORE INTO daily_digests (date_key, published_at) VALUES (?, ?)",
+            (date_key, time.time())
+        )
+        conn.commit()
+        conn.close()
+        print(f"[{now_msk.strftime('%H:%M')} МСК] Опубликована вечерняя сводка «Итоги дня».")
+        return True
+    return False
+
+
 def clean_text(raw_html):
     if not raw_html:
         return ""
@@ -124,25 +251,19 @@ def clean_text(raw_html):
     text = re.sub(r'<.*?>', '', text)
     text = " ".join(text.split())
 
-    # 1. Срезаем стандартные информагентства в начале строки
     text = re.sub(
         r'^[А-ЯЁA-Z][А-ЯЁа-яёA-Za-z\-]+[\.,]\s*\d+\s+[а-яё]+\.?\s*[—–\-]\s*(?:INTERFAX\.RU|Интерфакс|РИА Новости|ТАСС|РБК|ПРАЙМ|ИА REGNUM)\s*[—–\-\.]\s*',
         '',
         text,
         flags=re.IGNORECASE
     )
-    # 2. Срезаем прямые префиксы в начале
     text = re.sub(
         r'^(?:INTERFAX\.RU|Интерфакс|ТАСС|РИА Новости|РБК|Известия|Ведомости|Коммерсантъ|Лента\.ру|Газета\.Ru)\s*[:\-—–]\s*',
         '',
         text,
         flags=re.IGNORECASE
     )
-
-    # 3. Отрезаем любые знаки копирайта © до конца строки
     text = re.sub(r'©.*$', '', text)
-
-    # 4. Отрезаем хвосты вроде "Читать далее", "Подробнее..." в конце
     text = re.sub(
         r'(?:\s*\.\.\.)?\s*(?:Читать далее|Подробнее|Читайте также|Полный текст).*$',
         '',
@@ -150,7 +271,6 @@ def clean_text(raw_html):
         flags=re.IGNORECASE
     )
 
-    # 5. Обрезаем подвальные маркеры, если они прилипли в конец абзаца
     footer_markers = (
         "автономная некоммерческая организация",
         "«тв-новости»",
@@ -227,7 +347,6 @@ def extract_rss_full_text(entry):
         raw_full = entry["content"][0].get("value", "")
     if not raw_full:
         raw_full = entry.get("yandex_full-text", "") or entry.get("full-text", "")
-
     if not raw_full:
         return []
 
@@ -235,25 +354,22 @@ def extract_rss_full_text(entry):
     paras = []
     for p in parts:
         cleaned = clean_text(p)
-        if len(cleaned) >= 45 and cleaned not in paras:
+        if len(cleaned) >= 40 and cleaned not in paras:
             paras.append(cleaned)
-        if len(paras) >= 4:
+        if len(paras) >= 5:
             break
     return paras
 
 
-def fetch_full_article_paragraphs(entry, url, fallback_summary, title):
-    # 1. Сначала пробуем достать полный текст прямо из RSS
+def fetch_raw_article_text(entry, url, title):
     rss_paras = extract_rss_full_text(entry)
     if len(rss_paras) >= 2:
-        return rss_paras
+        return "\n".join(rss_paras)
 
-    # 2. Если в RSS только краткий анонс — скачиваем страницу статьи
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+            "Accept-Language": "ru-RU,ru;q=0.9"
         }
         resp = requests.get(url, headers=headers, timeout=12)
         if resp.status_code == 200:
@@ -264,7 +380,6 @@ def fetch_full_article_paragraphs(entry, url, fallback_summary, title):
                 raw_html,
                 flags=re.DOTALL | re.IGNORECASE
             )
-
             cut_patterns = [
                 r'<div[^>]+class="[^"]*(?:related|read-more|also-read|recommend|article__footer|social|comments)[^"]*"',
                 r'<section[^>]+class="[^"]*(?:related|read-more|also-read|recommend)[^"]*"'
@@ -275,67 +390,63 @@ def fetch_full_article_paragraphs(entry, url, fallback_summary, title):
                     html_body = html_body[:m.start()]
 
             raw_paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', html_body, flags=re.DOTALL | re.IGNORECASE)
-
             good_paragraphs = []
             junk_phrases = (
                 "читайте также", "подписывайтесь", "фото:", "источник:", "риа новости",
-                "тасс", "интерфакс", "interfax", "рбк", "все права защищены", "использование материалов",
-                "зарегистрировано", "роскомнадзор", "cookie", "нашли опечатку",
-                "материал дополняется", "подробнее в нашем", "наш телеграм",
-                "главный редактор:", "адрес редакции:", "политика ано",
+                "тасс", "интерфакс", "interfax", "рбк", "все права защищены",
                 "автономная некоммерческая организация", "«тв-новости»", "тв-новости",
-                "организации, признанные экстремистскими", "обработки персональных данных",
-                "сетевое издание", "учредитель:", "свидетельство о регистрации",
-                "вся информация, размещенная на данном", "перепечатка материалов",
-                "редакция не несет ответственности", "сообщает корреспондент", "©"
+                "сетевое издание", "свидетельство о регистрации", "©"
             )
-
-            total_len = 0
             for p in raw_paragraphs:
                 cleaned = clean_text(p)
-                if len(cleaned) < 45:
+                if len(cleaned) < 40 or "\ufffd" in cleaned:
                     continue
-                low = cleaned.lower()
-                if any(jp in low for jp in junk_phrases):
+                if any(jp in cleaned.lower() for jp in junk_phrases):
                     continue
-                if "\ufffd" in cleaned:
+                if cleaned.lower() == title.lower() or cleaned in good_paragraphs:
                     continue
-                if cleaned.lower() == title.lower():
-                    continue
-                if cleaned in good_paragraphs:
-                    continue
-
-                if len(good_paragraphs) >= 4 or total_len + len(cleaned) > 1800:
-                    break
                 good_paragraphs.append(cleaned)
-                total_len += len(cleaned) + 2
+                if len(good_paragraphs) >= 5:
+                    break
 
-            if good_paragraphs:
-                return good_paragraphs
+            if len(good_paragraphs) >= 2:
+                return "\n".join(good_paragraphs)
     except Exception:
         pass
 
-    return [fallback_summary] if fallback_summary else []
+    return ""
 
 
-def send_text_message(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHANNEL_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    try:
-        r = requests.post(url, json=payload, timeout=15)
-        return r.status_code == 200
-    except Exception as e:
-        print(f"Ошибка отправки текста: {e}")
-        return False
+def format_post_html(title, raw_body):
+    ai_text = call_gemini(
+        EDITOR_PROMPT,
+        f"Заголовок: {title}\n\nТекст новости:\n{raw_body[:3000]}",
+        max_tokens=450
+    )
+    if ai_text and len(ai_text) >= 180:
+        lines = [line.strip() for line in ai_text.splitlines() if line.strip()]
+        if len(lines) >= 2:
+            head = f"<b>{html.escape(lines[0])}</b>"
+            body = "\n\n".join(html.escape(line) for line in lines[1:])
+            formatted = f"{head}\n\n{body}"
+            if len(formatted) <= 1010:
+                return formatted
+
+    paras = [p.strip() for p in raw_body.splitlines() if p.strip()]
+    head = f"<b>{html.escape(title)}</b>"
+    body = "\n\n".join(html.escape(p) for p in paras[:3])
+    return f"{head}\n\n{body}"
 
 
-def send_photo_request(caption_html, image_url):
+def send_photo_post(caption_html, image_url):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    if len(caption_html) > 1015:
+        cut = caption_html[:1012]
+        last_space = cut.rfind(" ")
+        if last_space > 500:
+            cut = cut[:last_space]
+        caption_html = cut + "..."
+
     payload = {
         "chat_id": CHANNEL_ID,
         "photo": image_url,
@@ -345,72 +456,27 @@ def send_photo_request(caption_html, image_url):
     try:
         r = requests.post(url, json=payload, timeout=20)
         if r.status_code == 200:
-            return "OK"
-        if "caption is too long" in r.text.lower():
-            return "TOO_LONG"
+            return True
         img_resp = requests.get(image_url, timeout=10)
         if img_resp.status_code == 200:
             files = {"photo": ("image.jpg", img_resp.content, "image/jpeg")}
             data = {"chat_id": CHANNEL_ID, "caption": caption_html, "parse_mode": "HTML"}
             up_r = requests.post(url, data=data, files=files, timeout=25)
-            if up_r.status_code == 200:
-                return "OK"
-            if "caption is too long" in up_r.text.lower():
-                return "TOO_LONG"
+            return up_r.status_code == 200
     except Exception as e:
-        print(f"Ошибка при отправке фото: {e}")
-    return "FAIL"
-
-
-def publish_full_article(title, paragraphs, image_url=None):
-    title_escaped = f"<b>{html.escape(title)}</b>"
-    escaped_paras = [html.escape(p) for p in paragraphs if p.lower() != title.lower()]
-
-    full_post = title_escaped
-    if escaped_paras:
-        full_post += "\n\n" + "\n\n".join(escaped_paras)
-
-    if not image_url:
-        return send_text_message(full_post[:4090])
-
-    if len(full_post) <= 1020:
-        return send_photo_request(full_post, image_url) == "OK"
-
-    if send_photo_request(full_post[:4090], image_url) == "OK":
-        return True
-
-    part1_paras = []
-    current_len = len(title_escaped)
-    split_idx = 0
-
-    for idx, ep in enumerate(escaped_paras):
-        if current_len + len(ep) + 2 <= 1015:
-            part1_paras.append(ep)
-            current_len += len(ep) + 2
-            split_idx = idx + 1
-        else:
-            break
-
-    caption_part = title_escaped
-    if part1_paras:
-        caption_part += "\n\n" + "\n\n".join(part1_paras)
-
-    if send_photo_request(caption_part, image_url) == "OK":
-        remaining_paras = escaped_paras[split_idx:]
-        if remaining_paras:
-            time.sleep(0.5)
-            send_text_message("\n\n".join(remaining_paras)[:4090])
-        return True
-
+        print(f"Ошибка отправки фото: {e}")
     return False
 
 
 def publish_top_news():
     now_msk = datetime.now(MSK_TZ)
 
-    # Полный ночной сон (с WORK_END_HOUR до WORK_START_HOUR по МСК) — никаких постов ночью
     if not is_day_mode():
         print(f"[{now_msk.strftime('%H:%M')} МСК] Ночной режим (сон до {WORK_START_HOUR:02d}:00 МСК). Пропуск.")
+        return
+
+    # В 21:00–21:59 МСК один раз выпускаем вечернюю сводку «Итоги дня»
+    if try_publish_evening_digest(now_msk):
         return
 
     candidates = []
@@ -421,17 +487,11 @@ def publish_top_news():
         base_weight = feed_info["weight"]
 
         try:
-            rss_resp = requests.get(
-                feed_url,
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=8
-            )
+            rss_resp = requests.get(feed_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
             if rss_resp.status_code != 200:
-                print(f"Пропуск {source_name}: статус {rss_resp.status_code}")
                 continue
             feed = feedparser.parse(rss_resp.content)
-        except Exception as e:
-            print(f"Таймаут или ошибка {source_name}: {e}")
+        except Exception:
             continue
 
         for entry in feed.entries[:15]:
@@ -439,9 +499,7 @@ def publish_top_news():
             title = clean_text(entry.get("title", ""))
             summary = clean_text(entry.get("summary", entry.get("description", "")))
 
-            if not link or not title:
-                continue
-            if "\ufffd" in title or "\ufffd" in summary:
+            if not link or not title or "\ufffd" in title or "\ufffd" in summary:
                 continue
             if is_bad_content(link, title, summary):
                 continue
@@ -449,9 +507,7 @@ def publish_top_news():
                 continue
 
             keywords = extract_keywords(title)
-            if len(keywords) < 2:
-                continue
-            if is_duplicate_in_db(link, keywords):
+            if len(keywords) < 2 or is_duplicate_in_db(link, keywords):
                 continue
 
             full_text_lower = (title + " " + summary).lower()
@@ -487,26 +543,11 @@ def publish_top_news():
         if not image_url:
             continue
 
-        paragraphs = fetch_full_article_paragraphs(
+        raw_body = fetch_raw_article_text(
             best_news["entry"],
             best_news["link"],
-            best_news["summary"],
             best_news["title"]
         )
 
-        # Если полный текст не удалось достать (остался огрызок короче 250 знаков) — пропускаем новость
-        total_chars = sum(len(p) for p in paragraphs)
-        if total_chars < 250:
-            print(f"Пропуск (короткий огрызок вместо полного текста): {best_news['title']}")
-            continue
-
-        if publish_full_article(best_news["title"], paragraphs, image_url):
-            print(f"[{now_str} МСК] Опубликовано ({total_chars} зн., рейтинг {best_news['score']}): {best_news['title']}")
-            mark_as_posted(best_news["link"], best_news["title"], best_news["keywords"])
-            return
-
-
-if __name__ == "__main__":
-    init_db()
-    publish_top_news()
-    
+        if len(raw_body) < 250:
+            print(f"Пропуск (полный те
