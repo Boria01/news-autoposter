@@ -12,7 +12,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHANNEL_ID = "@glavnoe_chasa"
 
 MSK_TZ = timezone(timedelta(hours=3))
-WORK_START_HOUR = 9   # со скольки утра по МСК начинать постить (например, с 09:00)
+WORK_START_HOUR = 9   # со скольки утра по МСК начинать постить (09:00)
 WORK_END_HOUR = 1     # до скольки ночи по МСК постить (с 01:00 до 09:00 — полный сон)
 
 RSS_FEEDS = [
@@ -142,7 +142,15 @@ def clean_text(raw_html):
     # 3. Отрезаем любые знаки копирайта © до конца строки
     text = re.sub(r'©.*$', '', text)
 
-    # 4. Обрезаем подвальные маркеры, если они прилипли в конец абзаца
+    # 4. Отрезаем хвосты вроде "Читать далее", "Подробнее..." в конце
+    text = re.sub(
+        r'(?:\s*\.\.\.)?\s*(?:Читать далее|Подробнее|Читайте также|Полный текст).*$',
+        '',
+        text,
+        flags=re.IGNORECASE
+    )
+
+    # 5. Обрезаем подвальные маркеры, если они прилипли в конец абзаца
     footer_markers = (
         "автономная некоммерческая организация",
         "«тв-новости»",
@@ -213,72 +221,97 @@ def decode_html_properly(resp):
     return resp.content.decode("utf-8", errors="replace")
 
 
-def fetch_full_article_paragraphs(url, fallback_summary, title):
+def extract_rss_full_text(entry):
+    raw_full = ""
+    if "content" in entry and entry["content"]:
+        raw_full = entry["content"][0].get("value", "")
+    if not raw_full:
+        raw_full = entry.get("yandex_full-text", "") or entry.get("full-text", "")
+
+    if not raw_full:
+        return []
+
+    parts = re.split(r'</p>|<br\s*/?>|\n+', raw_full, flags=re.IGNORECASE)
+    paras = []
+    for p in parts:
+        cleaned = clean_text(p)
+        if len(cleaned) >= 45 and cleaned not in paras:
+            paras.append(cleaned)
+        if len(paras) >= 4:
+            break
+    return paras
+
+
+def fetch_full_article_paragraphs(entry, url, fallback_summary, title):
+    # 1. Сначала пробуем достать полный текст прямо из RSS
+    rss_paras = extract_rss_full_text(entry)
+    if len(rss_paras) >= 2:
+        return rss_paras
+
+    # 2. Если в RSS только краткий анонс — скачиваем страницу статьи
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
         }
-        resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code != 200:
-            return [fallback_summary] if fallback_summary else []
+        resp = requests.get(url, headers=headers, timeout=12)
+        if resp.status_code == 200:
+            raw_html = decode_html_properly(resp)
+            html_body = re.sub(
+                r'<(script|style|header|footer|nav|aside)[^>]*>.*?</\1>',
+                '',
+                raw_html,
+                flags=re.DOTALL | re.IGNORECASE
+            )
 
-        raw_html = decode_html_properly(resp)
-        html_body = re.sub(
-            r'<(script|style|header|footer|nav|aside)[^>]*>.*?</\1>',
-            '',
-            raw_html,
-            flags=re.DOTALL | re.IGNORECASE
-        )
+            cut_patterns = [
+                r'<div[^>]+class="[^"]*(?:related|read-more|also-read|recommend|article__footer|social|comments)[^"]*"',
+                r'<section[^>]+class="[^"]*(?:related|read-more|also-read|recommend)[^"]*"'
+            ]
+            for pat in cut_patterns:
+                m = re.search(pat, html_body, flags=re.IGNORECASE)
+                if m and m.start() > 500:
+                    html_body = html_body[:m.start()]
 
-        # Отрезаем хвост страницы с блоками "Читайте также / Похожие новости / Подвал статьи"
-        cut_patterns = [
-            r'<div[^>]+class="[^"]*(?:related|read-more|also-read|recommend|article__footer|social|comments)[^"]*"',
-            r'<section[^>]+class="[^"]*(?:related|read-more|also-read|recommend)[^"]*"'
-        ]
-        for pat in cut_patterns:
-            m = re.search(pat, html_body, flags=re.IGNORECASE)
-            if m and m.start() > 500:
-                html_body = html_body[:m.start()]
+            raw_paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', html_body, flags=re.DOTALL | re.IGNORECASE)
 
-        raw_paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', html_body, flags=re.DOTALL | re.IGNORECASE)
+            good_paragraphs = []
+            junk_phrases = (
+                "читайте также", "подписывайтесь", "фото:", "источник:", "риа новости",
+                "тасс", "интерфакс", "interfax", "рбк", "все права защищены", "использование материалов",
+                "зарегистрировано", "роскомнадзор", "cookie", "нашли опечатку",
+                "материал дополняется", "подробнее в нашем", "наш телеграм",
+                "главный редактор:", "адрес редакции:", "политика ано",
+                "автономная некоммерческая организация", "«тв-новости»", "тв-новости",
+                "организации, признанные экстремистскими", "обработки персональных данных",
+                "сетевое издание", "учредитель:", "свидетельство о регистрации",
+                "вся информация, размещенная на данном", "перепечатка материалов",
+                "редакция не несет ответственности", "сообщает корреспондент", "©"
+            )
 
-        good_paragraphs = []
-        junk_phrases = (
-            "читайте также", "подписывайтесь", "фото:", "источник:", "риа новости",
-            "тасс", "интерфакс", "interfax", "рбк", "все права защищены", "использование материалов",
-            "зарегистрировано", "роскомнадзор", "cookie", "нашли опечатку",
-            "материал дополняется", "подробнее в нашем", "наш телеграм",
-            "главный редактор:", "адрес редакции:", "политика ано",
-            "автономная некоммерческая организация", "«тв-новости»", "тв-новости",
-            "организации, признанные экстремистскими", "обработки персональных данных",
-            "сетевое издание", "учредитель:", "свидетельство о регистрации",
-            "вся информация, размещенная на данном", "перепечатка материалов",
-            "редакция не несет ответственности", "сообщает корреспондент", "©"
-        )
+            total_len = 0
+            for p in raw_paragraphs:
+                cleaned = clean_text(p)
+                if len(cleaned) < 45:
+                    continue
+                low = cleaned.lower()
+                if any(jp in low for jp in junk_phrases):
+                    continue
+                if "\ufffd" in cleaned:
+                    continue
+                if cleaned.lower() == title.lower():
+                    continue
+                if cleaned in good_paragraphs:
+                    continue
 
-        total_len = 0
-        for p in raw_paragraphs:
-            cleaned = clean_text(p)
-            if len(cleaned) < 45:
-                continue
-            low = cleaned.lower()
-            if any(jp in low for jp in junk_phrases):
-                continue
-            if "\ufffd" in cleaned:
-                continue
-            if cleaned.lower() == title.lower():
-                continue
-            if cleaned in good_paragraphs:
-                continue
+                if len(good_paragraphs) >= 4 or total_len + len(cleaned) > 1800:
+                    break
+                good_paragraphs.append(cleaned)
+                total_len += len(cleaned) + 2
 
-            # Берём максимум 4 основных абзаца статьи, чтобы не захватить чужие врезки снизу
-            if len(good_paragraphs) >= 4 or total_len + len(cleaned) > 1800:
-                break
-            good_paragraphs.append(cleaned)
-            total_len += len(cleaned) + 2
-
-        if good_paragraphs:
-            return good_paragraphs
+            if good_paragraphs:
+                return good_paragraphs
     except Exception:
         pass
 
@@ -426,6 +459,7 @@ def publish_top_news():
             image_url = extract_clean_rss_image(entry)
 
             candidates.append({
+                "entry": entry,
                 "source": source_name,
                 "link": link,
                 "title": title,
@@ -453,10 +487,20 @@ def publish_top_news():
         if not image_url:
             continue
 
-        paragraphs = fetch_full_article_paragraphs(best_news["link"], best_news["summary"], best_news["title"])
+        paragraphs = fetch_full_article_paragraphs(
+            best_news["entry"],
+            best_news["link"],
+            best_news["summary"],
+            best_news["title"]
+        )
+
+        # Если полный текст не удалось достать (остался огрызок короче 250 знаков) — пропускаем новость
+        total_chars = sum(len(p) for p in paragraphs)
+        if total_chars < 250:
+            print(f"Пропуск (короткий огрызок вместо полного текста): {best_news['title']}")
+            continue
 
         if publish_full_article(best_news["title"], paragraphs, image_url):
-            total_chars = sum(len(p) for p in paragraphs)
             print(f"[{now_str} МСК] Опубликовано ({total_chars} зн., рейтинг {best_news['score']}): {best_news['title']}")
             mark_as_posted(best_news["link"], best_news["title"], best_news["keywords"])
             return
@@ -465,4 +509,4 @@ def publish_top_news():
 if __name__ == "__main__":
     init_db()
     publish_top_news()
-        
+    
