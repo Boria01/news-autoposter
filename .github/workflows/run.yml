@@ -2,14 +2,20 @@ name: News Bot
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0,30 * * * *'
 
-permissions:
-  contents: write
+concurrency:
+  group: news-bot-singleton
+  cancel-in-progress: true
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
+    permissions:
+      contents: write
+
     steps:
       - name: Забираем код и базу
         uses: actions/checkout@v4
@@ -30,8 +36,11 @@ jobs:
 
       - name: Сохраняем историю постов в базу
         run: |
-          git config user.name "NewsBot"
-          git config user.email "bot@users.noreply.github.com"
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
           git add news_history.db
-          git diff --staged --quiet || (git commit -m "Update news history" && git push)
-          
+          if ! git diff --staged --quiet; then
+            git commit -m "Update news_history.db"
+            git pull --rebase origin main || true
+            git push
+          fi
