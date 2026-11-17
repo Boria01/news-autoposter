@@ -6,261 +6,178 @@ import requests
 from datetime import datetime, timezone, timedelta
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.functions.messages import GetExportedChatInvitesRequest
+from telethon.tl.functions.channels import GetFullChannelRequest
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_ID = int(os.environ["ADMIN_ID"])
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 TG_SESSION = os.environ["TG_SESSION"]
-CHANNEL_USERNAME = "glavnoe_chasa"
-CHANNEL_ID = f"@{CHANNEL_USERNAME}"
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_ID = int(os.environ["ADMIN_ID"])
+CHANNEL = os.environ.get("CHANNEL_USERNAME", "@glavnoe_chasa")
 
 MSK_TZ = timezone(timedelta(hours=3))
-REPORT_HOUR = 21
 DB_PATH = "analytics.db"
-LINKS_CONFIG = "links.json"
 
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS subscribers_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT,
-            date_msk TEXT,
-            hour_msk INTEGER,
-            count INTEGER
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS invite_links (
-            source_name TEXT PRIMARY KEY,
-            invite_link TEXT,
-            total_joins INTEGER DEFAULT 0,
-            last_checked TEXT
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS posts_metrics (
-            msg_id INTEGER PRIMARY KEY,
-            post_date TEXT,
-            text_preview TEXT,
-            views INTEGER DEFAULT 0,
-            forwards INTEGER DEFAULT 0,
-            replies INTEGER DEFAULT 0,
-            reactions_total INTEGER DEFAULT 0,
-            reactions_detail TEXT,
-            err_percent REAL DEFAULT 0.0,
-            er_percent REAL DEFAULT 0.0,
-            updated_at TEXT
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS daily_reports (
-            report_date TEXT PRIMARY KEY,
-            sent_at TEXT
+        CREATE TABLE IF NOT EXISTS daily_stats (
+            date_str TEXT PRIMARY KEY,
+            subscribers INTEGER,
+            posts_count INTEGER,
+            avg_views REAL,
+            err_percent REAL,
+            er_percent REAL,
+            report_sent INTEGER DEFAULT 0
         )
     """)
     conn.commit()
     return conn
 
 
-def tg_bot_api(method, payload=None):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    resp = requests.post(url, json=payload or {}, timeout=15).json()
-    if not resp.get("ok"):
-        print(f"[BotAPI Warning] {method}: {resp}")
-    return resp
+def send_telegram_report(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": ADMIN_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    try:
+        requests.post(url, json=payload, timeout=20)
+    except Exception as e:
+        print(f"[Telegram Send Error]: {e}")
 
 
-def sync_subscribers_and_links(conn, now_msk):
+def format_post_preview(raw_text):
+    if not raw_text:
+        return "Медиа-публикация без текста"
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    title = lines[0] if lines else raw_text.strip()
+    if len(title) > 68:
+        title = title[:65].rstrip(".,:;!?- ") + "..."
+    return title
+
+
+async def collect_and_report():
+    now_msk = datetime.now(MSK_TZ)
+    today_str = now_msk.strftime("%Y-%m-%d")
+    yesterday_str = (now_msk - timedelta(days=1)).strftime("%Y-%m-%d")
+    cutoff_24h = now_msk - timedelta(hours=24)
+
+    conn = init_db()
     cur = conn.cursor()
-    res = tg_bot_api("getChatMemberCount", {"chat_id": CHANNEL_ID})
-    subs_count = res.get("result", 0)
-    if subs_count > 0:
-        cur.execute(
-            "INSERT INTO subscribers_log (ts, date_msk, hour_msk, count) VALUES (?, ?, ?, ?)",
-            (now_msk.isoformat(), now_msk.strftime("%Y-%m-%d"), now_msk.hour, subs_count)
-        )
 
-    sources = []
-    if os.path.exists(LINKS_CONFIG):
-        with open(LINKS_CONFIG, "r", encoding="utf-8") as f:
-            sources = json.load(f).get("sources", [])
-
-    for src in sources:
-        cur.execute("SELECT invite_link FROM invite_links WHERE source_name = ?", (src,))
-        if not cur.fetchone():
-            created = tg_bot_api("createChatInviteLink", {
-                "chat_id": CHANNEL_ID,
-                "name": src[:32]
-            })
-            link = created.get("result", {}).get("invite_link")
-            if link:
-                cur.execute(
-                    "INSERT INTO invite_links (source_name, invite_link, total_joins, last_checked) VALUES (?, ?, 0, ?)",
-                    (src, link, now_msk.isoformat())
-                )
-
-    conn.commit()
-    return subs_count
-
-
-async def collect_mtproto_metrics(conn, subs_count, now_msk):
-    cur = conn.cursor()
     client = TelegramClient(
         StringSession(TG_SESSION),
         API_ID,
         API_HASH,
-        device_model="Samsung Galaxy S23",
+        device_model="Samsung Galaxy S24",
         system_version="Android 14",
         app_version="11.4.2",
         lang_code="ru",
         system_lang_code="ru-RU"
     )
-    async with client:
-        entity = await client.get_entity(CHANNEL_USERNAME)
 
-        async for msg in client.iter_messages(entity, limit=40):
-            if not msg.message and not msg.media:
+    async with client:
+        entity = await client.get_entity(CHANNEL)
+        full = await client(GetFullChannelRequest(channel=entity))
+        subs = full.full_chat.participants_count or 0
+
+        posts = []
+        async for msg in client.iter_messages(entity, limit=50):
+            if not msg.date:
+                continue
+            msg_date_msk = msg.date.astimezone(MSK_TZ)
+            if msg_date_msk < cutoff_24h:
+                break
+            if msg.views is None:
                 continue
 
-            views = msg.views or 0
-            forwards = msg.forwards or 0
-            replies = msg.replies.replies if msg.replies else 0
-
-            reactions_total = 0
-            reactions_map = []
+            reactions_count = 0
             if msg.reactions and msg.reactions.results:
-                for r in msg.reactions.results:
-                    cnt = r.count or 0
-                    reactions_total += cnt
-                    emoticon = getattr(r.reaction, "emoticon", "custom")
-                    reactions_map.append(f"{emoticon}:{cnt}")
+                reactions_count = sum(r.count for r in msg.reactions.results)
 
-            err = round((views / subs_count * 100), 2) if subs_count > 0 else 0.0
-            er = round(((reactions_total + forwards + replies) / views * 100), 2) if views > 0 else 0.0
+            forwards_count = msg.forwards or 0
+            posts.append({
+                "id": msg.id,
+                "text": format_post_preview(msg.message),
+                "views": msg.views,
+                "reactions": reactions_count,
+                "forwards": forwards_count
+            })
 
-            preview = (msg.message or "[Медиа-пост]").replace("\n", " ").strip()[:65]
-            post_dt_msk = msg.date.astimezone(MSK_TZ).strftime("%Y-%m-%d %H:%M")
+    posts_count = len(posts)
+    if posts_count > 0:
+        avg_views = round(sum(p["views"] for p in posts) / posts_count, 1)
+        total_reactions = sum(p["reactions"] for p in posts)
+        total_forwards = sum(p["forwards"] for p in posts)
+        err_percent = round((avg_views / subs * 100), 1) if subs > 0 else 0.0
+        avg_eng = (total_reactions + total_forwards) / posts_count
+        er_percent = round((avg_eng / subs * 100), 2) if subs > 0 else 0.0
+    else:
+        avg_views = 0.0
+        total_reactions = 0
+        total_forwards = 0
+        err_percent = 0.0
+        er_percent = 0.0
 
-            cur.execute("""
-                INSERT INTO posts_metrics (
-                    msg_id, post_date, text_preview, views, forwards, replies,
-                    reactions_total, reactions_detail, err_percent, er_percent, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(msg_id) DO UPDATE SET
-                    views=excluded.views,
-                    forwards=excluded.forwards,
-                    replies=excluded.replies,
-                    reactions_total=excluded.reactions_total,
-                    reactions_detail=excluded.reactions_detail,
-                    err_percent=excluded.err_percent,
-                    er_percent=excluded.er_percent,
-                    updated_at=excluded.updated_at
-            """, (
-                msg.id, post_dt_msk, preview, views, forwards, replies,
-                reactions_total, " ".join(reactions_map), err, er, now_msk.isoformat()
-            ))
+    cur.execute("SELECT subscribers FROM daily_stats WHERE date_str = ?", (yesterday_str,))
+    prev_row = cur.fetchone()
+    if prev_row and prev_row[0] is not None:
+        diff = subs - prev_row[0]
+        diff_str = f"+{diff}" if diff >= 0 else f"{diff}"
+    else:
+        diff_str = "+0"
 
-        try:
-            invites = await client(GetExportedChatInvitesRequest(
-                peer=entity,
-                admin_id=await client.get_me(),
-                limit=50
-            ))
-            for inv in invites.invites:
-                title = getattr(inv, "title", None)
-                usage = getattr(inv, "usage", 0) or 0
-                if title:
-                    cur.execute(
-                        "UPDATE invite_links SET total_joins = ?, last_checked = ? WHERE source_name = ?",
-                        (usage, now_msk.isoformat(), title)
-                    )
-        except Exception as e:
-            print(f"[Invites check skipped]: {e}")
-
-    conn.commit()
-
-
-def send_daily_report_if_needed(conn, subs_count, now_msk):
-    today_str = now_msk.strftime("%Y-%m-%d")
-    if now_msk.hour != REPORT_HOUR:
-        return
-
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM daily_reports WHERE report_date = ?", (today_str,))
-    if cur.fetchone():
-        return
-
-    cur.execute("SELECT count FROM subscribers_log WHERE date_msk = ? ORDER BY id ASC LIMIT 1", (today_str,))
-    first_row = cur.fetchone()
-    start_subs = first_row[0] if first_row else subs_count
-    delta = subs_count - start_subs
-    delta_str = f"+{delta}" if delta >= 0 else str(delta)
-
-    yesterday_str = (now_msk - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M")
-    cur.execute("""
-        SELECT COUNT(*), AVG(views), AVG(err_percent), AVG(er_percent), SUM(reactions_total), SUM(forwards)
-        FROM posts_metrics WHERE post_date >= ?
-    """, (yesterday_str,))
-    posts_cnt, avg_views, avg_err, avg_er, sum_react, sum_fwd = cur.fetchone()
+    cur.execute("SELECT report_sent FROM daily_stats WHERE date_str = ?", (today_str,))
+    sent_row = cur.fetchone()
+    already_sent = sent_row[0] if sent_row else 0
 
     cur.execute("""
-        SELECT text_preview, views, reactions_total, forwards, err_percent, reactions_detail
-        FROM posts_metrics WHERE post_date >= ?
-        ORDER BY (reactions_total * 2 + forwards * 3 + views * 0.05) DESC LIMIT 3
-    """, (yesterday_str,))
-    top_posts = cur.fetchall()
-
-    cur.execute("SELECT source_name, total_joins, invite_link FROM invite_links ORDER BY total_joins DESC")
-    links_rows = cur.fetchall()
-
-    lines = [
-        f"📊 <b>Аналитика @{CHANNEL_USERNAME} за {now_msk.strftime('%d.%m.%Y')}</b>\n",
-        f"👥 <b>Подписчики:</b> {subs_count} ({delta_str} за день)",
-        f"📰 <b>Постов за 24ч:</b> {posts_cnt or 0}",
-        f"👁 <b>Средний охват:</b> {int(avg_views or 0)} (ERR: {round(avg_err or 0, 1)}%)",
-        f"🔥 <b>Активность:</b> {sum_react or 0} реакций | {sum_fwd or 0} репостов (ER: {round(avg_er or 0, 1)}%)\n",
-        "🏆 <b>Топ-3 публикации дня:</b>"
-    ]
-
-    if top_posts:
-        for i, (prev, v, r, f, err, r_det) in enumerate(top_posts, 1):
-            lines.append(f"{i}. <i>{prev}...</i>\n   👁 {v} ({err}%) | ❤️ {r} ({r_det or '-'}) | 🔁 {f}")
-    else:
-        lines.append("— Нет данных за последние 24 часа")
-
-    lines.append("\n🔗 <b>Источники подписчиков (инвайт-ссылки):</b>")
-    if links_rows:
-        for name, joins, url in links_rows:
-            lines.append(f"• <b>{name}:</b> {joins} вступлений — <code>{url}</code>")
-    else:
-        lines.append("— Ссылки ещё не добавлены в links.json")
-
-    tg_bot_api("sendMessage", {
-        "chat_id": ADMIN_ID,
-        "text": "\n".join(lines),
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    })
-
-    cur.execute("INSERT INTO daily_reports (report_date, sent_at) VALUES (?, ?)", (today_str, now_msk.isoformat()))
+        INSERT OR REPLACE INTO daily_stats
+        (date_str, subscribers, posts_count, avg_views, err_percent, er_percent, report_sent)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (today_str, subs, posts_count, avg_views, err_percent, er_percent, already_sent))
     conn.commit()
 
+    # Отправляем отчёт в окне с 20:50 до 21:59 МСК один раз за день (или при ручном запуске)
+    is_manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+    in_report_window = (now_msk.hour == 20 and now_msk.minute >= 50) or (now_msk.hour == 21)
 
-def main():
-    now_msk = datetime.now(MSK_TZ)
-    print(f"[{now_msk.strftime('%H:%M МСК')}] Запуск сбора аналитики...")
-    conn = init_db()
-    subs_count = sync_subscribers_and_links(conn, now_msk)
-    asyncio.run(collect_mtproto_metrics(conn, subs_count, now_msk))
-    send_daily_report_if_needed(conn, subs_count, now_msk)
+    if is_manual or (in_report_window and not already_sent):
+        top_posts = sorted(posts, key=lambda x: (x["views"], x["reactions"]), reverse=True)[:3]
+
+        top_lines = []
+        for idx, p in enumerate(top_posts, 1):
+            post_err = round((p["views"] / subs * 100), 1) if subs > 0 else 0.0
+            top_lines.append(
+                f"<b>{idx}. {p['text']}</b>\n"
+                f"    👁 {p['views']} ({post_err}%)  •  ❤️ {p['reactions']}  •  🔁 {p['forwards']}"
+            )
+
+        top_block = "\n\n".join(top_lines) if top_lines else "<i>За последние 24 часа публикаций не было</i>"
+
+        report = (
+            f"📊 <b>Сводка {CHANNEL}</b>  |  <code>{now_msk.strftime('%d.%m.%Y')}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👥 <b>Подписчики:</b> {subs} (<b>{diff_str}</b> за день)\n"
+            f"📰 <b>Постов за 24ч:</b> {posts_count}\n"
+            f"👁 <b>Средний охват:</b> {int(avg_views)} (ERR: <b>{err_percent}%</b>)\n"
+            f"🔥 <b>Активность:</b> {total_reactions} ❤️  |  {total_forwards} 🔁 (ER: <b>{er_percent}%</b>)\n\n"
+            f"🏆 <b>Топ-3 публикации дня</b>\n\n"
+            f"{top_block}"
+        )
+
+        send_telegram_report(report)
+        cur.execute("UPDATE daily_stats SET report_sent = 1 WHERE date_str = ?", (today_str,))
+        conn.commit()
+
     conn.close()
-    print(f"[{now_msk.strftime('%H:%M МСК')}] Готово. Подписчиков: {subs_count}")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(collect_and_report())
+    
