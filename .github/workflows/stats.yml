@@ -3,7 +3,8 @@ name: Channel Analytics
 on:
   workflow_dispatch:
   schedule:
-    - cron: '55 * * * *'
+     - cron: '50 17 * * *'
+     - cron: '00 05 * * *'
 
 concurrency:
   group: stats-bot-singleton
