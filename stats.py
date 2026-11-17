@@ -145,7 +145,7 @@ async def collect_and_report():
 
     # Отправляем отчёт в окне с 20:50 до 21:59 МСК один раз за день (или при ручном запуске)
     is_manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
-    in_report_window = (now_msk.hour == 20 and now_msk.minute >= 50) or (now_msk.hour == 21)
+    in_report_window = (now_msk.hour == 20 and now_msk.minute >= 50) or (now_msk.hour >= 21)
 
     if is_manual or (in_report_window and not already_sent):
         top_posts = sorted(posts, key=lambda x: (x["views"], x["reactions"]), reverse=True)[:3]
