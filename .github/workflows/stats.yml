@@ -1,0 +1,50 @@
+name: Channel Analytics
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '15 * * * *'
+
+concurrency:
+  group: stats-bot-singleton
+  cancel-in-progress: true
+
+jobs:
+  collect-stats:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+
+    steps:
+      - name: Забираем код и базу аналитики
+        uses: actions/checkout@v4
+
+      - name: Настраиваем Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Устанавливаем зависимости
+        run: pip install requests telethon
+
+      - name: Собираем статистику канала
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+        run: python stats.py
+
+      - name: Сохраняем analytics.db в репозиторий
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add analytics.db
+          if ! git diff --staged --quiet; then
+            git commit -m "Update analytics.db"
+            git pull --rebase origin main || true
+            git push
+          fi
+          
