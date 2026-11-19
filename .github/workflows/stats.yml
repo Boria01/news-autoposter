@@ -3,8 +3,8 @@ name: Channel Analytics
 on:
   workflow_dispatch:
   schedule:
-     - cron: '50 17 * * *'
-     - cron: '00 05 * * *'
+    - cron: '0 18 * * *'
+    - cron: '0 5 * * *'
 
 concurrency:
   group: stats-bot-singleton
@@ -48,4 +48,3 @@ jobs:
             git pull --rebase origin main || true
             git push
           fi
-          
