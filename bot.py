@@ -338,6 +338,11 @@ def publish_top_news():
             print(f"Пропуск (слишком короткий текст): {best['title']}")
             continue
         post_html = format_post_html(best["title"], raw_body)
+
+        now = datetime.now(timezone(timedelta(hours=3)))
+        if now.minute in (29, 59):
+            time.sleep(60 - now.second)
+            
         if send_photo_post(post_html, best["image_url"]):
             print(f"[{now_msk.strftime('%H:%M')} МСК] Опубликовано ({len(post_html)} зн.): {best['title']}")
             mark_as_posted(best["link"], best["title"], best["keywords"])
